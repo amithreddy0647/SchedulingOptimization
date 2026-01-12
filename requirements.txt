@@ -1,0 +1,9 @@
+Flask
+openai>=1.0.0
+requests
+google-cloud-firestore
+ortools
+gunicorn
+firebase-admin
+google-genai
+python-dateutil
