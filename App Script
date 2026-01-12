@@ -1,0 +1,913 @@
+// ====================== CONFIG ======================
+const CLOUD_RUN_URL = "";
+const CLOUD_RUN_SERVICE_ACCOUNT_EMAIL = "";
+const PROJECT_ID = "";
+const REQUESTS_COLLECTION = "";
+const SHEET_ID = "";
+const SHEET_NAME = "";
+const ss = SpreadsheetApp.openById(SHEET_ID);
+const sheet = ss.getSheetByName("Form Responses 1");
+
+// ====================================================
+
+
+
+function sendMathErrorMessage_(to, name, totalDogs, calculatedTotal) {
+  if (!to) return;
+
+  const body = `
+Hi ${name || "there"},
+
+Thank you for your reservation request at PlayStayTion!
+
+We noticed a small discrepancy in your form:
+- You selected a **Total of ${totalDogs} dogs**.
+- However, your size breakdown adds up to **${calculatedTotal} dogs**.
+
+Because our automated optimizer needs exact data to assign rooms, we haven't been able to process this request yet. 
+
+**What to do next:**
+Please submit the form again with the corrected numbers, or reply to this email so we can fix it for you manually.
+
+Thank you!
+  `;
+
+  MailApp.sendEmail({
+    to: to,
+    subject: `Action Required: Issue with your PlayStayTion Request`,
+    body: body
+  });
+}
+
+function sendDateErrorMessage_(to, name, providedDate) {
+  if (!to) return;
+
+  const body = `
+Hi ${name || "there"},
+
+We received your reservation request for PlayStayTion, but we noticed a problem with the dates.
+
+You selected a check-in date of **${providedDate}**, which has already passed. Our system only accepts bookings for today or future dates.
+
+**How to fix this:**
+Please submit the form again with a valid future date.
+
+Thank you!
+  `;
+
+  MailApp.sendEmail({
+    to: to,
+    subject: `Issue with your PlayStayTion Request: Date Error`,
+    body: body
+  });
+}
+
+/**
+ * onFormSubmit(e) - Installable/Bound form submit trigger must point to this function.
+ * e: event object from Form Submit (Apps Script).
+ */
+function onFormSubmit(e) {
+  Logger.log("onFormSubmit: started");
+  try {
+    // Accept both bound (e.range present) and standalone (no event) cases.
+    const sheet = (e && e.range) ? e.range.getSheet() : SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
+    const lastRow = (e && e.range) ? e.range.getRow() : sheet.getLastRow();
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const rowVals = sheet.getRange(lastRow, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+    // Build a simple header -> index map (case-insensitive)
+    const headerIndex = {};
+    headers.forEach((h, i) => { headerIndex[(h || "").toString().trim().toLowerCase()] = i + 1; });
+
+    // Helper to read column by a few candidate names (returns value or "")
+    const readCol = (candidates) => {
+      candidates = Array.isArray(candidates) ? candidates : [candidates];
+      for (const cand of candidates) {
+        const key = (cand || "").toString().trim().toLowerCase();
+        if (key && headerIndex[key]) return rowVals[headerIndex[key] - 1];
+      }
+      return "";
+    };
+
+    // Read fields (adapt names to your sheet headers)
+    const fullName = readCol(['full name','full name','customer name','name']);
+    const email = readCol(['email address','email']);
+    const phone = readCol(['phone (optional)','phone number','phone']);
+    const ciRaw = readCol(['check-in date','check in date','checkin']);
+    const coRaw = readCol(['check-out date','check out date','checkout']);
+    const totalDogs = Number(readCol(['total number of dogs','total dogs','total'])) || 0;
+    const small = Number(readCol(['how many SMALL (<20 lb)?','small'])) || 0;
+    const medium = Number(readCol(['how many MEDIUM (20–50 lb)?','medium'])) || 0;
+    const large = Number(readCol(['how many LARGE (50–90 lb)?','large'])) || 0;
+    const xl = Number(readCol(['how many EXTRA-LARGE (>90 lb)?','extra-large','xl'])) || 0;
+    const roomPref = readCol(['room preference','room type']) || 'No preference';
+    const notes = readCol(['notes / special requests (optional)','notes / special requests','notes']) || '';
+
+    const calculatedTotal = small + medium + large + xl;
+
+    if (calculatedTotal !== totalDogs) {
+      const cStatus = ensureColumn_(sheet, 'status');
+      const cErr = ensureColumn_(sheet, 'validator_errors');
+      
+      // 1. Mark the sheet so you have a record
+      sheet.getRange(lastRow, cStatus).setValue('error');
+      sheet.getRange(lastRow, cErr).setValue(`Math mismatch: Total=${totalDogs}, Sum=${calculatedTotal}`);
+      sheet.getRange(lastRow, 1, 1, sheet.getLastColumn()).setBackground('#fff2cc'); // Warning Yellow
+
+      // 2. Send the "Correction Needed" email
+      sendMathErrorMessage_(email, fullName, totalDogs, calculatedTotal);
+      
+      Logger.log("Aborting: Sent math error email to " + email);
+      return; // Stop the RAG/Cloud Run process
+    }
+
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()); // Normalize to midnight
+    
+    // Use your existing parseDateOnly_ helper
+    let ciDate = null;
+    try { ciDate = parseDateOnly_(ciRaw); } catch (err) { ciDate = null; }
+
+    // --- NEW CONSTRAINT: PREVENT PAST DATES ---
+    if (ciDate && ciDate < today) {
+      const cStatus = ensureColumn_(sheet, 'status');
+      const cErr = ensureColumn_(sheet, 'validator_errors');
+      
+      sheet.getRange(lastRow, cStatus).setValue('error');
+      sheet.getRange(lastRow, cErr).setValue(`Invalid Date: Check-in (${ciRaw}) cannot be in the past.`);
+      sheet.getRange(lastRow, 1, 1, sheet.getLastColumn()).setBackground('#ead1dc'); // Light Purple
+
+      // Send the "Past Date" error email
+      sendDateErrorMessage_(email, fullName, ciRaw);
+      
+      Logger.log("Aborting: Past date submitted by " + email);
+      return; // Stop the process
+    }
+
+    // Validate & parse dates (defensive)
+    let ci = null, co = null;
+    try { ci = parseDateOnly_(ciRaw); } catch (err) { ci = null; }
+    try { co = parseDateOnly_(coRaw); } catch (err) { co = null; }
+    if (!ci || !co) {
+      // Write error to sheet and stop
+      const cStatus = ensureColumn_(sheet, 'status');
+      const cReq = ensureColumn_(sheet, 'request_id');
+      const cErr = ensureColumn_(sheet, 'validator_errors');
+      sheet.getRange(lastRow, cStatus).setValue('error');
+      sheet.getRange(lastRow, cErr).setValue('Missing or invalid check-in/check-out date');
+      Logger.log('onFormSubmit: invalid dates, aborting.');
+      return;
+    }
+
+    // Build payload for Firestore (plain JS types)
+    const requestId = makeRequestId_();
+    const payload = {
+      request_id: requestId,
+      status: 'pending',
+      created_at: new Date(),
+      sheet_row: lastRow,
+      contact: { name: String(fullName || ''), email: String(email || ''), phone: String(phone || '') },
+      requested_range: { check_in: ci, check_out: co },
+      dogs: { total: totalDogs, small: small, medium: medium, large: large, xl: xl },
+      room_preference: String(roomPref),
+      notes: String(notes)
+    };
+
+    // Create Firestore document
+    Logger.log('onFormSubmit: creating Firestore doc for ' + requestId);
+    firestoreCreate_(REQUESTS_COLLECTION, requestId, payload);
+
+    // Update sheet with request_id and pending
+    const colReq = ensureColumn_(sheet, 'request_id');
+    const colStatus = ensureColumn_(sheet, 'status');
+    const colErr = ensureColumn_(sheet, 'validator_errors');
+    sheet.getRange(lastRow, colReq).setValue(requestId);
+    sheet.getRange(lastRow, colStatus).setValue('pending');
+    sheet.getRange(lastRow, colErr).setValue('');
+
+    // Optionally run quick confirm flow (kept minimal here)
+    try {
+      processNewRequest_(requestId, payload, sheet, lastRow);
+    } catch (inner) {
+      // don't block main flow if optimizer throws
+      Logger.log('processNewRequest_ failed but request is in Firestore: ' + inner);
+    }
+
+    Logger.log('onFormSubmit: completed for ' + requestId);
+    return;
+
+  } catch (err) {
+    Logger.log('onFormSubmit ERROR: ' + String(err) + '\n' + (err && err.stack ? err.stack : ''));
+    throw err;
+  }
+}
+
+
+/**
+ * testWriteFirestore() - manual test helper you can run from the editor.
+ * It writes a small test doc so you can verify scripts creds / Firestore access.
+ */
+function testWriteFirestore() {
+  const id = 'TEST-' + Utilities.getUuid().slice(0,8);
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${encodeURIComponent(REQUESTS_COLLECTION)}?documentId=${encodeURIComponent(id)}`;
+  const now = new Date();
+  const doc = {
+    fields: {
+      request_id: { stringValue: id },
+      status: { stringValue: "test" },
+      created_at: { timestampValue: now.toISOString() },
+      note: { stringValue: "created-by-apps-script testWriteFirestore()" }
+    }
+  };
+  const opts = {
+    method: "post",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify(doc)
+  };
+  const resp = UrlFetchApp.fetch(url, opts);
+  Logger.log("HTTP Code: " + resp.getResponseCode());
+  Logger.log("Body: " + resp.getContentText());
+}
+
+
+/* ============================
+   Light-weight processNewRequest_ (quick check/confirm)
+   Keep simple: if free room found, create booking & patch request.
+   If not, mark needs_optimization (so Cloud Run can pick it up).
+   ============================ */
+function processNewRequest_(requestId, payload, sheet, lastRow) {
+  
+  try {
+    // Pull doc defaults if available (tolerant)
+    const prices = safeFirestoreGetDoc_('prices/current');
+    const seasons = safeFirestoreGetDoc_('seasons/default') || { fields: { mode: { stringValue: 'standard' } } };
+    const mode = seasons.fields?.mode?.stringValue || 'standard';
+
+    // Determine requested window (respect times)
+    const ci = new Date(payload.requested_range.check_in);
+    const co = new Date(payload.requested_range.check_out);
+    const start = new Date(ci); start.setHours(15,0,0,0);
+    const end = new Date(co); end.setHours(12,0,0,0);
+
+    const dogs = payload.dogs || { total:0, small:0, medium:0, large:0, xl:0 };
+
+    // Still validate counts (important)
+    const actualCount = (dogs.small || 0) + (dogs.medium || 0) + (dogs.large || 0) + (dogs.xl || 0);
+    if (actualCount !== (dogs.total || 0)) {
+      return markNeedsOpt_(`Validation Error: Total dogs (${dogs.total}) does not match sum of sizes (${actualCount})`, sheet, lastRow, requestId);
+    }
+
+    // Only compute typeOrder for DIRECT FIT attempt.
+    // If request is not feasible for a single room, we still send to optimizer.
+    const canStandard = isStandardFeasible_(dogs);
+    const canKing = isKingFeasible_(dogs);
+    const typeOrder = chooseRoomTypeOrder_(payload.room_preference || 'No preference', canStandard, canKing);
+
+    // If not direct-feasible in any single room type, DO NOT RETURN.
+    // Mark needs_opt and trigger Cloud Run.
+    if (!typeOrder.length) {
+      markNeedsOpt_('Not direct-feasible as a single-room booking; sending to optimizer.', sheet, lastRow, requestId);
+      try { triggerCloudRunOptimizer_(requestId); } catch (e) { Logger.log('Cloud Run trigger failed: ' + e); }
+      return;
+    }
+
+
+    if (actualCount !== (dogs.total || 0)) {
+      return markNeedsOpt_(`Validation Error: Total dogs (${dogs.total}) does not match sum of sizes (${actualCount})`, sheet, lastRow, requestId);
+    }
+
+    const rooms = firestoreList_('rooms').map(fromFirestoreRoom_);
+    const bookings = firestoreList_('bookings').map(fromFirestoreBooking_);
+
+    // Find free room
+    let chosen = null;
+    for (const t of typeOrder) {
+      const candidateRooms = rooms.filter(r => r.type === t && r.status === 'active' && r.allow_overnight);
+      for (const room of candidateRooms) {
+        const conflicts = bookings.some(b => b.room_id === room.room_id && rangesOverlap_(start, end, b.start_dt, b.end_dt));
+        if (!conflicts) { chosen = { room, type: t }; break; }
+      }
+      if (chosen) break;
+    }
+
+    if (!chosen) {
+      markNeedsOpt_('No free room window found; sending to optimizer.', sheet, lastRow, requestId);
+      // Optionally call Cloud Run optimizer
+      try { triggerCloudRunOptimizer_(requestId); } catch (e) { Logger.log('Cloud Run trigger failed: ' + e); }
+      return;
+    }
+
+    // Price calculation (fallback defaults if prices missing)
+    const nights = Math.max(1, Math.round((stripTime_(co) - stripTime_(ci)) / (1000*60*60*24)));
+    const rateDoc = fromFirestorePrices_(prices || {});
+    const nightly = (mode === 'peak') ? (chosen.type === 'king' ? rateDoc.peak.king : rateDoc.peak.standard) : (chosen.type === 'king' ? rateDoc.base.king : rateDoc.base.standard);
+    const addDogFee = Math.max(0, (dogs.total - 1)) * rateDoc.add_dog;
+    const earlyFee = 0;
+    const lateFee = 0;
+    const total = nights * nightly + addDogFee + earlyFee + lateFee;
+
+    const bookingId = makeBookingId_();
+    const booking = {
+      booking_id: bookingId,
+      room_id: chosen.room.room_id,
+      room_type: chosen.type,
+      source: 'form',
+      request_id: requestId,
+      contact: payload.contact,
+      dogs,
+      start_dt: start,
+      end_dt: end,
+      nights,
+      pricing: { mode, nightly_rate: nightly, nights, add_dog_fee: addDogFee, early_fee: earlyFee, late_fee: lateFee, total },
+      created_at: new Date()
+    };
+
+    firestoreCreate_('bookings', bookingId, booking);
+
+    // Patch request -> confirmed
+    firestorePatch_(`requests/${requestId}`, {
+      status: 'confirmed',
+      assigned_room_id: chosen.room.room_id,
+      assigned_room_type: chosen.type,
+      pricing: booking.pricing,
+      confirmed_at: new Date()
+    });
+
+    // Update sheet row
+    const cStatus = ensureColumn_(sheet, 'status');
+    const cErr = ensureColumn_(sheet, 'validator_errors');
+    const cRoom   = ensureColumn_(sheet, 'assigned_rooms'); // New column
+    const cBook   = ensureColumn_(sheet, 'booking_ids');
+    sheet.getRange(lastRow, cStatus).setValue('confirmed');
+    sheet.getRange(lastRow, cErr).setValue('');
+    sheet.getRange(lastRow, cRoom).setValue(chosen.room.room_id); // Write Room ID
+    sheet.getRange(lastRow, cBook).setValue(bookingId);
+    // (Emailing is optional — skip until Firestore flow stable)
+    sendConfirmationEmail_(payload.contact.email, payload.contact.name, booking);
+
+  } catch (err) {
+    Logger.log('processNewRequest_ error: ' + err);
+    markNeedsOpt_('Optimizer error: ' + String(err), sheet, lastRow, requestId);
+  }
+}
+
+function sendConfirmationEmail_(to, name, booking) {
+  if (!to) return;
+  const roomLabel = booking.room_type === 'king' ? 'King Suite' : 'Standard Room';
+  const startStr = booking.start_dt.toLocaleString();
+  const endStr   = booking.end_dt.toLocaleString();
+  const pr = booking.pricing;
+  const lines = [
+    `Hi ${name || 'there'},`,
+    ``,
+    `Great news — we’ve confirmed your reservation!`,
+    ``,
+    `Room: ${roomLabel} (${booking.room_id})`,
+    `From: ${startStr}`,
+    `To:   ${endStr}`,
+    ``,
+    `Price breakdown:`,
+    `  Nights x Rate: ${pr.nights} × $${pr.nightly_rate} = $${pr.nights * pr.nightly_rate}`,
+    `  Add'l dogs:    $${pr.add_dog_fee}`,
+    `  Early check-in: $${pr.early_fee}`,
+    `  Late check-out: $${pr.late_fee}`,
+    `  ----------------------------`,
+    `  Total:         $${pr.total}`,
+    ``,
+    `If you have any questions, just reply to this email.`,
+    ``,
+    `Thanks!`
+  ].join('\n');
+
+  MailApp.sendEmail({
+    to,
+    subject: `Reservation Confirmed — ${roomLabel} (${booking.booking_id})`,
+    htmlBody: lines.replace(/\n/g, '<br>')
+  });
+}
+
+
+/* ============================
+   markNeedsOpt_ updates Firestore + sheet
+   ============================ */
+function markNeedsOpt_(reason, sheet, lastRow, requestId) {
+  // 1) Patch the REQUEST doc (correct collection)
+  try {
+    firestorePatch_(`requests/${requestId}`, {
+      status: 'needs_optimization',
+      reason_no_fit: reason,
+      needs_opt_at: new Date()
+    });
+  } catch (e) {
+    Logger.log('markNeedsOpt_ patch requests failed: ' + e);
+  }
+
+  // 2) Update the sheet (status + error)
+  const cStatus = ensureColumn_(sheet, 'status');
+  const cErr    = ensureColumn_(sheet, 'validator_errors');
+  sheet.getRange(lastRow, cStatus).setValue('needs_optimization');
+  sheet.getRange(lastRow, cErr).setValue(reason);
+
+  // 3) Trigger Cloud Run optimizer (event-driven, no polling)
+  try {
+    triggerCloudRunOptimizer_(requestId);
+  } catch (e) {
+    Logger.log('Cloud Run trigger failed in markNeedsOpt_: ' + e);
+    // keep sheet status as needs_optimization; you’ll see trigger error in logs
+  }
+}
+
+
+/**
+ * Polls Cloud Run for request statuses and sends email for confirmed bookings.
+ */
+function pollCloudRunResults() {
+
+  const SHEET = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const rows = SHEET.getDataRange().getValues();
+  const header = rows[0];
+
+  // Column lookup
+  const idxRequestId = header.indexOf("request_id");
+  const idxEmail     = header.indexOf("Email Address");
+  const idxName      = header.indexOf("Full name");
+  const idxCheckIn   = header.indexOf("Check-in date");
+  const idxCheckOut  = header.indexOf("Check-out date");
+  const idxStatus    = header.indexOf("status");
+
+  if (idxRequestId === -1 || idxStatus === -1) {
+    Logger.log("Required columns missing.");
+    return;
+  } 
+
+  for (let i = 1; i < rows.length; i++) {
+
+    const reqId   = rows[i][idxRequestId];
+    const status  = rows[i][idxStatus];
+    const email   = rows[i][idxEmail];
+    const name    = rows[i][idxName];
+    const ci      = rows[i][idxCheckIn];
+    const co      = rows[i][idxCheckOut];
+
+    // Only poll pending requests
+    if (!reqId) continue;
+    if (status === "confirmed_by_llm" || status === "email_sent") continue;
+
+    try {
+      const url = `${CLOUD_RUN_URL}/status/${reqId}`;
+
+      const response = UrlFetchApp.fetch(url, {
+        method: "get",
+        muteHttpExceptions: true,
+        headers: { "Content-Type": "application/json" }
+      });
+
+      const code = response.getResponseCode();
+      if (code !== 200) {
+        Logger.log(`Cloud Run returned ${code} for ${reqId}`);
+        continue;
+      }
+
+      const data = JSON.parse(response.getContentText());
+
+      if (!data || !data.status) continue;
+
+      // Update status in sheet
+      SHEET.getRange(i + 1, idxStatus + 1).setValue(data.status);
+
+      // If Cloud Run confirmed → send Gmail
+      if (data.status === "confirmed_by_llm") {
+        sendConfirmationEmail_(email, name, reqId, ci, co);
+
+        SHEET.getRange(i + 1, idxStatus + 1).setValue("email_sent");
+      }
+
+    } catch (err) {
+      Logger.log(`Error polling ${reqId}: ${err}`);
+    }
+  }
+}
+
+/**
+ * Google Apps Script Web App endpoint
+ * Receives JSON payload from Cloud Run and updates the Google Sheet row.
+ *
+ * Expected JSON payload:
+ * {
+ *   "sheet_row": 12,
+ *   "status": "confirmed_by_llm" | "confirmed_by_cpsat" | "rejected" | "audit_failed" | ...,
+ *   "error_msg": "optional string",
+ *   "assigned_rooms": ["R01","R10"],
+ *   "booking_ids": ["REQ-...-P1","REQ-...-P2"]
+ * }
+ */
+
+function doPost(e) {
+  try {
+    const data = JSON.parse(e.postData.contents || "{}");
+
+    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
+    const row = Number(data.sheet_row);
+    if (!row || row < 2) throw new Error("Missing or invalid sheet_row");
+
+    // Ensure columns exist (you already have ensureColumn_)
+    const colStatus = ensureColumn_(sheet, "status");
+    const colErr    = ensureColumn_(sheet, "validator_errors");
+    const colRoom   = ensureColumn_(sheet, "assigned_rooms");
+    const colBook   = ensureColumn_(sheet, "booking_ids");
+
+    // Write status + error
+    sheet.getRange(row, colStatus).setValue(data.status || "updated");
+    sheet.getRange(row, colErr).setValue(data.error_msg || "");
+
+    // assigned_rooms + booking_ids
+    if (Array.isArray(data.assigned_rooms)) {
+      sheet.getRange(row, colRoom).setValue(data.assigned_rooms.join(", "));
+    } else if (typeof data.assigned_rooms === "string") {
+      sheet.getRange(row, colRoom).setValue(data.assigned_rooms);
+    }
+
+    if (Array.isArray(data.booking_ids)) {
+      sheet.getRange(row, colBook).setValue(data.booking_ids.join(", "));
+    } else if (typeof data.booking_ids === "string") {
+      sheet.getRange(row, colBook).setValue(data.booking_ids);
+    }
+
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: true }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: false, error: String(err) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+
+/**
+ * Ensure a column exists with the given header name.
+ * Creates a new column at the end if missing.
+ * Returns 1-based column index.
+ */
+function ensureColumn_(sheet, headerName) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+
+  let idx = headers.indexOf(headerName);
+  if (idx !== -1) return idx + 1;
+
+  // add new column at end
+  sheet.insertColumnAfter(lastCol);
+  const newCol = lastCol + 1;
+  sheet.getRange(1, newCol).setValue(headerName);
+  return newCol;
+}
+
+/**
+ * Return a JSON response.
+ * (Note: Apps Script doesn't truly set HTTP status reliably,
+ * but including it helps debugging and some clients.)
+ */
+function jsonOut_(obj, statusCode) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doGet(e) {
+  return ContentService
+    .createTextOutput(
+      JSON.stringify({
+        status: "OK",
+        message: "Web App is running. Use POST to update Sheets."
+      })
+    )
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Scheduled trigger: runs every 1 minute
+ * Looks for rows marked "needs_optimization"
+ * If Cloud Run has finished execution, update sheet to "confirmed"
+ */
+function getAllBookings_() {
+  const url = `${BASE_URL}/bookings`;
+  const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  const json = JSON.parse(res.getContentText());
+  return json.documents || [];
+}
+
+function markEmailSent_(bookingId) {
+  const url = `${BASE_URL}/bookings/${bookingId}?updateMask.fieldPaths=email_sent`;
+
+  const payload = {
+    fields: {
+      email_sent: { stringValue: "yes" }
+    }
+  };
+
+  UrlFetchApp.fetch(url, {
+    method: "PATCH",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+}
+function getField_(field) {
+  if (!field) return "";
+  if (field.stringValue) return field.stringValue;
+  if (field.integerValue) return field.integerValue;
+  if (field.timestampValue) return field.timestampValue;
+  return "";
+}
+
+function guessRoomType_(roomId) {
+  if (!roomId) return "standard";
+  return roomId.startsWith("K") ? "King Suite" : "Standard Room";
+}
+
+function pollFirestoreForConfirmed() {
+  Logger.log("Polling Firestore for confirmed bookings…");
+
+  const bookings = getAllBookings_();
+
+  bookings.forEach(b => {
+    let bid = b.name.split('/').pop(); // booking document ID
+    let data = b.fields;
+    let email = getField_(data.email);
+    
+    if (!email) return;
+
+    let alreadySent = getField_(data.email_sent) === "yes";
+    if (alreadySent) return;
+
+    // If booking has status = Confirmed → send email
+    let status = getField_(data.status);
+    if (status === 'Confirmed') {
+      Logger.log(`Sending email for booking ${bid}`);
+      sendConfirmationEmail_(email, getField_(data.name), prepareEmailBooking_(bid, data));
+
+      // Mark Firestore booking as emailed
+      markEmailSent_(bid);
+    }
+  });
+}
+
+function prepareEmailBooking_(bookingId, fields) {
+  return {
+    booking_id: bookingId,
+    room_id: getField_(fields.room_id),
+    room_type: guessRoomType_(getField_(fields.room_id)),
+    start: getField_(fields.start_dt),
+    end: getField_(fields.end_dt),
+    dogs: {
+      small: Number(getField_(fields.dogs?.mapValue?.fields?.small) || 0),
+      medium: Number(getField_(fields.dogs?.mapValue?.fields?.medium) || 0),
+      large: Number(getField_(fields.dogs?.mapValue?.fields?.large) || 0),
+      xl: Number(getField_(fields.dogs?.mapValue?.fields?.xl) || 0),
+    }
+  };
+}
+function pollForConfirmedBookings() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+  const range = sheet.getDataRange();
+  const rows = range.getValues();
+
+  const header = rows[0];
+
+  // Column index lookup
+  const idxEmail = header.indexOf("Email Address");
+  const idxName = header.indexOf("Full name");
+  const idxStatus = header.indexOf("status");
+  const idxRequestId = header.indexOf("request_id");
+  const idxCheckIn = header.indexOf("Check-in date");
+  const idxCheckOut = header.indexOf("Check-out date");
+
+  if (idxEmail === -1 || idxName === -1 || idxStatus === -1 || idxRequestId === -1) {
+    Logger.log("Required columns missing.");
+    return;
+  }
+
+  for (let i = 1; i < rows.length; i++) {
+    const status = rows[i][idxStatus];
+
+    // Only send for Cloud Run confirmations
+    if (status === "confirmed_by_llm") {
+      const email = rows[i][idxEmail];
+      const name = rows[i][idxName];
+      const reqId = rows[i][idxRequestId];
+      const ci = rows[i][idxCheckIn];
+      const co = rows[i][idxCheckOut];
+
+      sendConfirmationEmail_(email, name, reqId, ci, co);
+
+      // Mark row as emailed
+      sheet.getRange(i + 1, idxStatus + 1).setValue("email_sent");
+    }
+  }
+}
+
+
+
+
+/* ============================
+   FIRESTORE helpers (create/get/list/patch)
+   ============================ */
+function firestoreCreate_(collection, docId, obj) {
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${encodeURIComponent(collection)}?documentId=${encodeURIComponent(docId)}`;
+  const body = toFirestoreDocument_(obj);
+  const res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
+  });
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error(`Firestore create failed (${code}): ${res.getContentText()}`);
+  }
+  return JSON.parse(res.getContentText());
+}
+function firestoreGetDoc_(docPath) {
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${docPath}`;
+  const res = UrlFetchApp.fetch(url, { method: 'get', headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+  if (res.getResponseCode() === 404) return null;
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) throw new Error(`Firestore get failed (${code}): ${res.getContentText()}`);
+  return JSON.parse(res.getContentText());
+}
+function safeFirestoreGetDoc_(path) { try { return firestoreGetDoc_(path); } catch (e) { Logger.log('safeFirestoreGetDoc_ failed: ' + e); return null; } }
+function firestoreList_(collection) {
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${encodeURIComponent(collection)}?pageSize=1000`;
+  const res = UrlFetchApp.fetch(url, { method: 'get', headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true });
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) throw new Error(`Firestore list failed (${code}): ${res.getContentText()}`);
+  return JSON.parse(res.getContentText()).documents || [];
+}
+function firestorePatch_(docPath, obj) {
+  const fields = Object.keys(obj);
+  const mask = fields.map(f => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join('&');
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${docPath}?${mask}`;
+  const body = { fields: toFirestoreFields_(obj) };
+  const res = UrlFetchApp.fetch(url, { method: 'patch', contentType: 'application/json', headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, payload: JSON.stringify(body), muteHttpExceptions: true });
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) throw new Error(`Firestore patch failed (${code}): ${res.getContentText()}`);
+  return JSON.parse(res.getContentText());
+}
+
+
+/* ============================
+   Serialization helpers
+   ============================ */
+function toFirestoreDocument_(obj) { return { fields: toFirestoreFields_(obj) }; }
+function toFirestoreFields_(obj) {
+  const out = {};
+  Object.keys(obj || {}).forEach(k => out[k] = toValue_(obj[k]));
+  return out;
+}
+function toValue_(val) {
+  if (val === null || val === undefined) return { nullValue: null };
+  const t = Object.prototype.toString.call(val);
+  if (t === '[object String]') return { stringValue: String(val) };
+  if (t === '[object Number]') return Number.isInteger(val) ? { integerValue: String(val) } : { doubleValue: val };
+  if (t === '[object Boolean]') return { booleanValue: val };
+  if (t === '[object Date]') return { timestampValue: val.toISOString() };
+  if (t === '[object Array]') return { arrayValue: { values: val.map(v => toValue_(v)) } };
+  return { mapValue: { fields: toFirestoreFields_(val) } };
+}
+
+/* ============================
+   Simple deserializers used
+   ============================ */
+function fromFirestoreRoom_(doc) { const f = doc.fields || {}; return { room_id: f.room_id?.stringValue, type: f.type?.stringValue, status: f.status?.stringValue, allow_overnight: !!f.allow_overnight?.booleanValue }; }
+function fromFirestoreBooking_(doc) { const f = doc.fields || {}; return { booking_id: f.booking_id?.stringValue, room_id: f.room_id?.stringValue, start_dt: new Date(f.start_dt?.timestampValue), end_dt: new Date(f.end_dt?.timestampValue) }; }
+function fromFirestorePrices_(doc) { const f = doc?.fields || {}; const getNumeric = (x,d)=>+(x?.integerValue||x?.doubleValue||d||0); return { base:{standard:getNumeric(f.base?.mapValue?.fields?.standard,69),king:getNumeric(f.base?.mapValue?.fields?.king,99)}, peak:{standard:getNumeric(f.peak?.mapValue?.fields?.standard,79),king:getNumeric(f.peak?.mapValue?.fields?.king,109)}, add_dog:getNumeric(f.add_dog,39), early_fee:{standard:getNumeric(f.early_fee?.mapValue?.fields?.standard,19),king:getNumeric(f.early_fee?.mapValue?.fields?.king,29)}, late_fee:{standard:getNumeric(f.late_fee?.mapValue?.fields?.standard,19),king:getNumeric(f.late_fee?.mapValue?.fields?.king,29)} }; }
+
+/* ============================
+   Business helpers (copied)
+   ============================ */
+function isStandardFeasible_(dogs) { const s=+dogs.small,m=+dogs.medium,l=+dogs.large,x=+dogs.xl,t=+dogs.total; if (t===1 && (s===1||m===1||l===1)) return true; if (t===2 && s===2) return true; return false; }
+function isKingFeasible_(dogs) {
+  const s = +dogs.small || 0;
+  const m = +dogs.medium || 0;
+  const l = +dogs.large || 0;
+  const x = +dogs.xl || 0;
+
+  const t = s + m + l + x;
+  if (t < 1 || t > 4) return false;
+
+  // XL rule: if XL present -> exactly one XL only
+  if (x > 0) return (x === 1 && t === 1 && s === 0 && m === 0 && l === 0);
+
+  // Unit rule
+  const unitTotal = (s * 1) + (m * 2) + (l * 3);
+  return unitTotal <= 4;
+}
+
+function chooseRoomTypeOrder_(pref, canStandard, canKing) { if(pref==='Standard'&&canStandard) return ['standard']; if(pref==='King'&&canKing) return ['king']; if(pref==='Standard'&&!canStandard&&canKing) return ['king']; if(pref==='King'&&!canKing&&canStandard) return ['standard']; if(pref==='No preference'){ if(canStandard&&canKing) return ['standard','king']; if(canStandard) return ['standard']; if(canKing) return ['king']; } return []; }
+
+/* ============================
+   Utilities
+   ============================ */
+function makeRequestId_(){ const ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(),"yyyyMMddHHmmss"); const r = Math.floor(Math.random()*1e6).toString().padStart(6,'0'); return `REQ-${ts}-${r}`; }
+function makeBookingId_(){ const ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(),"yyyyMMddHHmmss"); const r = Math.floor(Math.random()*1e6).toString().padStart(6,'0'); return `BKG-${ts}-${r}`; }
+function ensureColumn_(sheet, headerName) { const first = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0]; let idx = first.indexOf(headerName)+1; if(idx===0){ sheet.insertColumnAfter(sheet.getLastColumn()); idx = sheet.getLastColumn(); sheet.getRange(1,idx).setValue(headerName);} return idx; }
+function parseDateOnly_(raw) { if(Object.prototype.toString.call(raw)==='[object Date]') return raw; const d = new Date(raw); if(!isNaN(d)) return d; throw new Error('Invalid date: '+ raw); }
+function rangesOverlap_(aStart,aEnd,bStart,bEnd){ return aStart < bEnd && aEnd > bStart; }
+function stripTime_(d){ return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+
+/* ============================
+   Cloud Run trigger (optional)
+   - requires service account with roles/iam.serviceAccountTokenCreator on the SA you call
+   ============================ */
+function triggerCloudRunOptimizer_(requestId) {
+  if (!CLOUD_RUN_URL || CLOUD_RUN_URL.indexOf('YOUR_') === 0) { Logger.log('Cloud Run not configured; skipping'); return; }
+  const jwt = getCloudRunJwt_();
+  const endpoint = CLOUD_RUN_URL.replace(/\/$/,'') + '/optimize/' + encodeURIComponent(requestId);
+  const res = UrlFetchApp.fetch(endpoint, { method: 'post', headers: { Authorization: 'Bearer ' + jwt }, muteHttpExceptions: true });
+  if (![200,202].includes(res.getResponseCode())) throw new Error('Cloud Run call failed: ' + res.getResponseCode() + ' ' + res.getContentText());
+  Logger.log('Cloud Run triggered for ' + requestId);
+}
+function getCloudRunJwt_() {
+  if (!CLOUD_RUN_SERVICE_ACCOUNT_EMAIL) throw new Error('CLOUD_RUN_SERVICE_ACCOUNT_EMAIL not set');
+  const token = ScriptApp.getOAuthToken();
+  const url = `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(CLOUD_RUN_SERVICE_ACCOUNT_EMAIL)}:generateIdToken`;
+  const payload = JSON.stringify({ audience: CLOUD_RUN_URL, includeEmail: true });
+  const res = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', payload: payload, headers: { Authorization: 'Bearer ' + token }, muteHttpExceptions: true });
+  if (res.getResponseCode() !== 200) throw new Error('generateIdToken failed: ' + res.getResponseCode() + ' ' + res.getContentText());
+  return JSON.parse(res.getContentText()).token;
+}
+
+/*** const PROJECT_ID = "pet-resort-optimizer"; ***/
+const BASE_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+ // or “Bookings” depending on your setup
+
+
+
+/*function sendConfirmationEmail_(to, name, requestId, checkIn, checkOut) {
+  if (!to) return;
+
+  const body = `
+Hi ${name || "there"},
+
+Your reservation request (${requestId}) has been confirmed!
+
+Check-in:  ${checkIn}
+Check-out: ${checkOut}
+
+Your room has been assigned and confirmed by our automated optimizer.
+
+Thank you for choosing PlayStayTion!
+  `;
+
+  MailApp.sendEmail({
+    to: to,
+    subject: `Your PlayStayTion Booking is Confirmed (${requestId})`,
+    body: body,
+    htmlBody: body.replace(/\n/g, "<br>")
+  });
+}*/
+
+
+/*** Testig AI ***/
+
+/**
+ * Fills all rooms with 2 small dogs for a specific date range.
+ * Run this to set up your "Gridlock" scenario.
+ */
+function setupFullCapacityTest() {
+  const testStartDate = new Date("2026-02-10T15:00:00Z"); // Adjust to your test date
+  const testEndDate = new Date("2026-02-12T12:00:00Z");   // Adjust to your test date
+  
+  const rooms = firestoreList_('rooms').map(fromFirestoreRoom_);
+  Logger.log(`Found ${rooms.length} rooms. Starting batch fill...`);
+
+  rooms.forEach(room => {
+    const bookingId = "TEST-FILL-" + room.room_id + "-" + Utilities.getUuid().slice(0,4);
+    const payload = {
+      booking_id: bookingId,
+      room_id: room.room_id,
+      room_type: room.type,
+      status: "Confirmed",
+      source: "stress_test_script",
+      start_dt: testStartDate,
+      end_dt: testEndDate,
+      dogs: { total: 2, small: 2, medium: 0, large: 0, xl: 0 },
+      contact: { name: "Test Filler", email: "test@example.com" }
+    };
+
+    try {
+      firestoreCreate_('bookings', bookingId, payload);
+      Logger.log(`Filled Room ${room.room_id}`);
+    } catch (e) {
+      Logger.log(`Error filling room ${room.room_id}: ${e}`);
+    }
+  });
+  
+  Logger.log("Resort is now at 100% capacity for test dates.");
+}
