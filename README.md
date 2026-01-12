@@ -55,8 +55,7 @@ Motto : validate LLM decision-making against CP-SAT using the same constraints, 
     - Patches requests/<request_id> with final status + metadata
     - Cloud Run updates the Google Sheet via Apps Script Web App callback
 
-***Phase 3: Results Logging 
-***
+***Phase 3: Results Logging ***
 
 1) After a plan is produced (LLM or CP-SAT) and validated:
     - Cloud Run writes evaluation outputs back to Firestore
