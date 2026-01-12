@@ -16,6 +16,7 @@ The pipeline integrates:
 Motto : validate LLM decision-making against CP-SAT using the same constraints, scenarios, and audit rules.
 
 **High-level architecture**
+<img width="1196" height="692" alt="image (2)" src="https://github.com/user-attachments/assets/4952d033-443c-4073-b8dc-2dc7f5f638ce" />
 
 ***Phase 1***: Intake & Direct Fit (Apps Script)
 
