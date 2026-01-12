@@ -15,7 +15,7 @@ from openai import OpenAI
 # Config (ENV VARS)
 # -------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2")  # change if you want
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2") 
 
 WEB_APP_URL = os.environ.get("WEB_APP_URL", "")
 SHEETS_SHARED_SECRET = os.environ.get("SHEETS_SHARED_SECRET", "")
